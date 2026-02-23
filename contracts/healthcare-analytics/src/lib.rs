@@ -1,8 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Map, String, Symbol,
-    Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Map,
+    String, Symbol, Vec,
 };
 
 /// --------------------
@@ -137,6 +137,46 @@ pub struct QualityMetric {
     pub calculated_rate: u32,
 }
 
+// --- Referral workflow types ---
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReferralStatus {
+    Pending,
+    Accepted,
+    Declined,
+    Scheduled,
+    InProgress,
+    Completed,
+    Cancelled,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Referral {
+    pub referral_id: u64,
+    pub referring_provider: Address,
+    pub receiving_provider: Address,
+    pub patient_id: Address,
+    pub specialty: Symbol,
+    pub reason: String,
+    pub priority: Symbol,
+    pub status: ReferralStatus,
+    pub created_at: u64,
+    pub accepted_at: Option<u64>,
+    pub completed_at: Option<u64>,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum ReferralError {
+    NotFound = 1,
+    Unauthorized = 2,
+    InvalidState = 3,
+    InvalidInput = 4,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SatisfactionRecord {
@@ -161,6 +201,37 @@ pub struct ReadmissionRecord {
 /// --------------------
 /// Storage Keys
 /// --------------------
+/// Extended referral data (decline info, completion, etc.) stored separately
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferralDeclineInfo {
+    pub decline_reason: String,
+    pub suggest_alternative: Option<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferralCompletionInfo {
+    pub consultation_summary_hash: BytesN<32>,
+    pub recommendations: String,
+    pub followup_required: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CareSummaryRecord {
+    pub from_provider: Address,
+    pub summary_type: Symbol,
+    pub summary_hash: BytesN<32>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CareSummaryRequestRecord {
+    pub requesting_provider: Address,
+    pub information_needed: Vec<Symbol>,
+}
+
 #[contracttype]
 pub enum DataKey {
     Outcomes(String),
@@ -172,6 +243,15 @@ pub enum DataKey {
     ProviderSatisfaction(Address),
     ComplianceData(Address, Symbol, u64),
     BenchmarkData(Symbol, String),
+    // Referral workflow
+    NextReferralId,
+    Referral(u64),
+    EstimatedAppointment(u64),
+    ReferralDecline(u64),
+    ReferralStatusNote(u64),
+    ReferralCompletion(u64),
+    CareSummary(u64, Symbol),
+    CareSummaryRequest(u64),
 }
 
 #[contract]
@@ -677,6 +757,364 @@ impl HealthcareAnalytics {
 
         scores.push_back(record.satisfaction_score);
         env.storage().persistent().set(&provider_key, &scores);
+    }
+
+    // --- Referral workflow ---
+
+    /// Create a new referral from referring provider to receiving provider.
+    pub fn create_referral(
+        env: Env,
+        referring_provider: Address,
+        patient_id: Address,
+        referred_to: Address,
+        specialty: Symbol,
+        reason: String,
+        priority: Symbol,
+        clinical_summary_hash: BytesN<32>,
+        requested_services: Vec<Symbol>,
+    ) -> Result<u64, ReferralError> {
+        referring_provider.require_auth();
+
+        let next_id_key = DataKey::NextReferralId;
+        let next_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&next_id_key)
+            .unwrap_or(0);
+        let referral_id = next_id + 1;
+        env.storage().persistent().set(&next_id_key, &referral_id);
+
+        let now = env.ledger().timestamp();
+        let referral = Referral {
+            referral_id,
+            referring_provider: referring_provider.clone(),
+            receiving_provider: referred_to.clone(),
+            patient_id,
+            specialty,
+            reason,
+            priority,
+            status: ReferralStatus::Pending,
+            created_at: now,
+            accepted_at: None,
+            completed_at: None,
+        };
+
+        let key = DataKey::Referral(referral_id);
+        env.storage().persistent().set(&key, &referral);
+
+        // Store initial clinical summary as first shared summary
+        let summary_key = DataKey::CareSummary(referral_id, symbol_short!("clinical"));
+        env.storage().persistent().set(
+            &summary_key,
+            &CareSummaryRecord {
+                from_provider: referring_provider.clone(),
+                summary_type: symbol_short!("clinical"),
+                summary_hash: clinical_summary_hash,
+            },
+        );
+
+        env.events().publish(
+            (symbol_short!("ref_creat"), referring_provider),
+            (referral_id, referred_to, requested_services),
+        );
+
+        Ok(referral_id)
+    }
+
+    /// Accept a referral (receiving provider only).
+    pub fn accept_referral(
+        env: Env,
+        referral_id: u64,
+        receiving_provider: Address,
+        estimated_appointment_date: Option<u64>,
+    ) -> Result<(), ReferralError> {
+        receiving_provider.require_auth();
+
+        let key = DataKey::Referral(referral_id);
+        let mut referral: Referral = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ReferralError::NotFound)?;
+
+        if referral.receiving_provider != receiving_provider {
+            return Err(ReferralError::Unauthorized);
+        }
+        if referral.status != ReferralStatus::Pending {
+            return Err(ReferralError::InvalidState);
+        }
+
+        let now = env.ledger().timestamp();
+        referral.status = ReferralStatus::Accepted;
+        referral.accepted_at = Some(now);
+        env.storage().persistent().set(&key, &referral);
+
+        if let Some(date) = estimated_appointment_date {
+            env.storage()
+                .persistent()
+                .set(&DataKey::EstimatedAppointment(referral_id), &date);
+        }
+
+        env.events().publish(
+            (symbol_short!("ref_acc"), receiving_provider),
+            (referral_id, estimated_appointment_date),
+        );
+
+        Ok(())
+    }
+
+    /// Decline a referral (receiving provider only).
+    pub fn decline_referral(
+        env: Env,
+        referral_id: u64,
+        receiving_provider: Address,
+        decline_reason: String,
+        suggest_alternative: Option<Address>,
+    ) -> Result<(), ReferralError> {
+        receiving_provider.require_auth();
+
+        let key = DataKey::Referral(referral_id);
+        let mut referral: Referral = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ReferralError::NotFound)?;
+
+        if referral.receiving_provider != receiving_provider {
+            return Err(ReferralError::Unauthorized);
+        }
+        if referral.status != ReferralStatus::Pending {
+            return Err(ReferralError::InvalidState);
+        }
+
+        referral.status = ReferralStatus::Declined;
+        env.storage().persistent().set(&key, &referral);
+        env.storage().persistent().set(
+            &DataKey::ReferralDecline(referral_id),
+            &ReferralDeclineInfo {
+                decline_reason,
+                suggest_alternative,
+            },
+        );
+
+        env.events().publish(
+            (symbol_short!("ref_decl"), receiving_provider),
+            referral_id,
+        );
+
+        Ok(())
+    }
+
+    /// Update referral status (referring or receiving provider).
+    pub fn update_referral_status(
+        env: Env,
+        referral_id: u64,
+        provider_id: Address,
+        status: Symbol,
+        status_note: Option<String>,
+    ) -> Result<(), ReferralError> {
+        provider_id.require_auth();
+
+        let key = DataKey::Referral(referral_id);
+        let mut referral: Referral = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ReferralError::NotFound)?;
+
+        let is_participant = referral.referring_provider == provider_id
+            || referral.receiving_provider == provider_id;
+        if !is_participant {
+            return Err(ReferralError::Unauthorized);
+        }
+        if referral.status == ReferralStatus::Declined || referral.status == ReferralStatus::Cancelled
+        {
+            return Err(ReferralError::InvalidState);
+        }
+
+        let new_status = symbol_to_referral_status(&status);
+        referral.status = new_status.clone();
+        env.storage().persistent().set(&key, &referral);
+
+        if let Some(note) = status_note {
+            env.storage()
+                .persistent()
+                .set(&DataKey::ReferralStatusNote(referral_id), &note);
+        }
+
+        env.events().publish(
+            (symbol_short!("ref_st_up"), provider_id),
+            (referral_id, status),
+        );
+
+        Ok(())
+    }
+
+    /// Complete a referral with consultation summary (receiving provider only).
+    pub fn complete_referral(
+        env: Env,
+        referral_id: u64,
+        receiving_provider: Address,
+        consultation_summary_hash: BytesN<32>,
+        recommendations: String,
+        followup_required: bool,
+    ) -> Result<(), ReferralError> {
+        receiving_provider.require_auth();
+
+        let key = DataKey::Referral(referral_id);
+        let mut referral: Referral = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ReferralError::NotFound)?;
+
+        if referral.receiving_provider != receiving_provider {
+            return Err(ReferralError::Unauthorized);
+        }
+        if referral.status == ReferralStatus::Declined
+            || referral.status == ReferralStatus::Cancelled
+            || referral.status == ReferralStatus::Completed
+        {
+            return Err(ReferralError::InvalidState);
+        }
+
+        let now = env.ledger().timestamp();
+        referral.status = ReferralStatus::Completed;
+        referral.completed_at = Some(now);
+        env.storage().persistent().set(&key, &referral);
+
+        env.storage().persistent().set(
+            &DataKey::ReferralCompletion(referral_id),
+            &ReferralCompletionInfo {
+                consultation_summary_hash,
+                recommendations,
+                followup_required,
+            },
+        );
+
+        env.events().publish(
+            (symbol_short!("ref_done"), receiving_provider),
+            (referral_id, followup_required),
+        );
+
+        Ok(())
+    }
+
+    /// Share a care summary for a referral (referring or receiving provider).
+    pub fn share_care_summary(
+        env: Env,
+        referral_id: u64,
+        from_provider: Address,
+        summary_type: Symbol,
+        summary_hash: BytesN<32>,
+    ) -> Result<(), ReferralError> {
+        from_provider.require_auth();
+
+        let key = DataKey::Referral(referral_id);
+        let referral: Referral = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ReferralError::NotFound)?;
+
+        let is_participant = referral.referring_provider == from_provider
+            || referral.receiving_provider == from_provider;
+        if !is_participant {
+            return Err(ReferralError::Unauthorized);
+        }
+        if referral.status == ReferralStatus::Declined || referral.status == ReferralStatus::Cancelled
+        {
+            return Err(ReferralError::InvalidState);
+        }
+
+        let summary_key = DataKey::CareSummary(referral_id, summary_type.clone());
+        env.storage().persistent().set(
+            &summary_key,
+            &CareSummaryRecord {
+                from_provider: from_provider.clone(),
+                summary_type: summary_type.clone(),
+                summary_hash,
+            },
+        );
+
+        env.events().publish(
+            (symbol_short!("care_shr"), from_provider),
+            (referral_id, summary_type),
+        );
+
+        Ok(())
+    }
+
+    /// Request care summary / information from the other provider.
+    pub fn request_care_summary(
+        env: Env,
+        referral_id: u64,
+        requesting_provider: Address,
+        information_needed: Vec<Symbol>,
+    ) -> Result<(), ReferralError> {
+        requesting_provider.require_auth();
+
+        let key = DataKey::Referral(referral_id);
+        let referral: Referral = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ReferralError::NotFound)?;
+
+        let is_participant = referral.referring_provider == requesting_provider
+            || referral.receiving_provider == requesting_provider;
+        if !is_participant {
+            return Err(ReferralError::Unauthorized);
+        }
+        if referral.status == ReferralStatus::Declined || referral.status == ReferralStatus::Cancelled
+        {
+            return Err(ReferralError::InvalidState);
+        }
+
+        let request_key = DataKey::CareSummaryRequest(referral_id);
+        env.storage().persistent().set(
+            &request_key,
+            &CareSummaryRequestRecord {
+                requesting_provider: requesting_provider.clone(),
+                information_needed: information_needed.clone(),
+            },
+        );
+
+        env.events().publish(
+            (symbol_short!("care_req"), requesting_provider),
+            (referral_id, information_needed),
+        );
+
+        Ok(())
+    }
+
+    /// Get referral by id (for clients and status tracking).
+    pub fn get_referral(env: Env, referral_id: u64) -> Result<Referral, ReferralError> {
+        let key = DataKey::Referral(referral_id);
+        env.storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ReferralError::NotFound)
+    }
+}
+
+fn symbol_to_referral_status(s: &Symbol) -> ReferralStatus {
+    if *s == symbol_short!("pending") {
+        ReferralStatus::Pending
+    } else if *s == symbol_short!("accepted") {
+        ReferralStatus::Accepted
+    } else if *s == symbol_short!("declined") {
+        ReferralStatus::Declined
+    } else if *s == symbol_short!("sched") {
+        ReferralStatus::Scheduled
+    } else if *s == symbol_short!("in_prog") {
+        ReferralStatus::InProgress
+    } else if *s == symbol_short!("completed") {
+        ReferralStatus::Completed
+    } else if *s == symbol_short!("cancelled") {
+        ReferralStatus::Cancelled
+    } else {
+        ReferralStatus::Pending
     }
 }
 
