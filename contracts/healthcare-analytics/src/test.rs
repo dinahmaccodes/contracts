@@ -3,7 +3,7 @@
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    Address, BytesN, Env, String, Vec,
+    symbol_short, Address, BytesN, Env, String, Symbol, Vec,
 };
 
 #[test]
@@ -602,4 +602,445 @@ fn test_empty_population_statistics() {
     assert_eq!(stats.gender_distribution.male, 0);
     assert_eq!(stats.gender_distribution.female, 0);
     assert_eq!(stats.gender_distribution.other, 0);
+}
+
+// --- Referral workflow tests ---
+
+fn setup_referral_parties(env: &Env) -> (Address, Address, Address) {
+    let referring = Address::generate(env);
+    let receiving = Address::generate(env);
+    let patient = Address::generate(env);
+    (referring, receiving, patient)
+}
+
+#[test]
+fn test_create_referral() {
+    let env = Env::default();
+    let contract_id = env.register(HealthcareAnalytics, ());
+    let client = HealthcareAnalyticsClient::new(&env, &contract_id);
+    let (referring, receiving, patient) = setup_referral_parties(&env);
+
+    env.mock_all_auths();
+
+    let specialty = symbol_short!("cardio");
+    let reason = String::from_str(&env, "Cardiac evaluation needed");
+    let priority = symbol_short!("urgent");
+    let clinical_hash: BytesN<32> = BytesN::from_array(&env, &[1u8; 32]);
+    let mut services: Vec<Symbol> = Vec::new(&env);
+    services.push_back(symbol_short!("echo"));
+    services.push_back(symbol_short!("stress"));
+
+    let id = client.create_referral(
+        &referring,
+        &patient,
+        &receiving,
+        &specialty,
+        &reason,
+        &priority,
+        &clinical_hash,
+        &services,
+    );
+
+    assert_eq!(id, 1);
+
+    let r = client.get_referral(&id);
+    assert_eq!(r.referral_id, 1);
+    assert_eq!(r.referring_provider, referring);
+    assert_eq!(r.receiving_provider, receiving);
+    assert_eq!(r.patient_id, patient);
+    assert_eq!(r.specialty, specialty);
+    assert_eq!(r.reason, reason);
+    assert_eq!(r.priority, priority);
+    assert_eq!(r.status, ReferralStatus::Pending);
+    assert!(r.accepted_at.is_none());
+    assert!(r.completed_at.is_none());
+}
+
+#[test]
+fn test_accept_referral() {
+    let env = Env::default();
+    let contract_id = env.register(HealthcareAnalytics, ());
+    let client = HealthcareAnalyticsClient::new(&env, &contract_id);
+    let (referring, receiving, patient) = setup_referral_parties(&env);
+
+    env.mock_all_auths();
+
+    let id = client.create_referral(
+        &referring,
+        &patient,
+        &receiving,
+        &symbol_short!("cardio"),
+        &String::from_str(&env, "Evaluation"),
+        &symbol_short!("routine"),
+        &BytesN::from_array(&env, &[2u8; 32]),
+        &Vec::new(&env),
+    );
+
+    client.accept_referral(&id, &receiving, &Some(1700000000));
+
+    let r = client.get_referral(&id);
+    assert_eq!(r.status, ReferralStatus::Accepted);
+    assert!(r.accepted_at.is_some());
+}
+
+#[test]
+fn test_accept_referral_unauthorized() {
+    let env = Env::default();
+    let contract_id = env.register(HealthcareAnalytics, ());
+    let client = HealthcareAnalyticsClient::new(&env, &contract_id);
+    let (referring, receiving, patient) = setup_referral_parties(&env);
+    let other = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    let id = client.create_referral(
+        &referring,
+        &patient,
+        &receiving,
+        &symbol_short!("cardio"),
+        &String::from_str(&env, "Eval"),
+        &symbol_short!("routine"),
+        &BytesN::from_array(&env, &[0u8; 32]),
+        &Vec::new(&env),
+    );
+
+    let res = client.try_accept_referral(&id, &other, &None);
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_decline_referral() {
+    let env = Env::default();
+    let contract_id = env.register(HealthcareAnalytics, ());
+    let client = HealthcareAnalyticsClient::new(&env, &contract_id);
+    let (referring, receiving, patient) = setup_referral_parties(&env);
+
+    env.mock_all_auths();
+
+    let id = client.create_referral(
+        &referring,
+        &patient,
+        &receiving,
+        &symbol_short!("neuro"),
+        &String::from_str(&env, "Consult"),
+        &symbol_short!("routine"),
+        &BytesN::from_array(&env, &[0u8; 32]),
+        &Vec::new(&env),
+    );
+
+    client.decline_referral(
+        &id,
+        &receiving,
+        &String::from_str(&env, "Full capacity"),
+        &None,
+    );
+
+    let r = client.get_referral(&id);
+    assert_eq!(r.status, ReferralStatus::Declined);
+}
+
+#[test]
+fn test_decline_referral_with_alternative() {
+    let env = Env::default();
+    let contract_id = env.register(HealthcareAnalytics, ());
+    let client = HealthcareAnalyticsClient::new(&env, &contract_id);
+    let (referring, receiving, patient) = setup_referral_parties(&env);
+    let alternative = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    let id = client.create_referral(
+        &referring,
+        &patient,
+        &receiving,
+        &symbol_short!("neuro"),
+        &String::from_str(&env, "Consult"),
+        &symbol_short!("routine"),
+        &BytesN::from_array(&env, &[0u8; 32]),
+        &Vec::new(&env),
+    );
+
+    client.decline_referral(
+        &id,
+        &receiving,
+        &String::from_str(&env, "Redirect"),
+        &Some(alternative),
+    );
+
+    let r = client.get_referral(&id);
+    assert_eq!(r.status, ReferralStatus::Declined);
+}
+
+#[test]
+fn test_update_referral_status() {
+    let env = Env::default();
+    let contract_id = env.register(HealthcareAnalytics, ());
+    let client = HealthcareAnalyticsClient::new(&env, &contract_id);
+    let (referring, receiving, patient) = setup_referral_parties(&env);
+
+    env.mock_all_auths();
+
+    let id = client.create_referral(
+        &referring,
+        &patient,
+        &receiving,
+        &symbol_short!("cardio"),
+        &String::from_str(&env, "Eval"),
+        &symbol_short!("routine"),
+        &BytesN::from_array(&env, &[0u8; 32]),
+        &Vec::new(&env),
+    );
+
+    client.accept_referral(&id, &receiving, &None);
+
+    client.update_referral_status(
+        &id,
+        &receiving,
+        &symbol_short!("sched"),
+        &Some(String::from_str(&env, "Appt set")),
+    );
+
+    let r = client.get_referral(&id);
+    assert_eq!(r.status, ReferralStatus::Scheduled);
+
+    client.update_referral_status(&id, &receiving, &symbol_short!("in_prog"), &None);
+
+    let r = client.get_referral(&id);
+    assert_eq!(r.status, ReferralStatus::InProgress);
+}
+
+#[test]
+fn test_complete_referral() {
+    let env = Env::default();
+    let contract_id = env.register(HealthcareAnalytics, ());
+    let client = HealthcareAnalyticsClient::new(&env, &contract_id);
+    let (referring, receiving, patient) = setup_referral_parties(&env);
+
+    env.mock_all_auths();
+
+    let id = client.create_referral(
+        &referring,
+        &patient,
+        &receiving,
+        &symbol_short!("cardio"),
+        &String::from_str(&env, "Eval"),
+        &symbol_short!("urgent"),
+        &BytesN::from_array(&env, &[0u8; 32]),
+        &Vec::new(&env),
+    );
+
+    client.accept_referral(&id, &receiving, &None);
+
+    client.complete_referral(
+        &id,
+        &receiving,
+        &BytesN::from_array(&env, &[5u8; 32]),
+        &String::from_str(&env, "Continue meds, follow up in 6 months"),
+        &true,
+    );
+
+    let r = client.get_referral(&id);
+    assert_eq!(r.status, ReferralStatus::Completed);
+    assert!(r.completed_at.is_some());
+}
+
+#[test]
+fn test_complete_referral_unauthorized() {
+    let env = Env::default();
+    let contract_id = env.register(HealthcareAnalytics, ());
+    let client = HealthcareAnalyticsClient::new(&env, &contract_id);
+    let (referring, receiving, patient) = setup_referral_parties(&env);
+
+    env.mock_all_auths();
+
+    let id = client.create_referral(
+        &referring,
+        &patient,
+        &receiving,
+        &symbol_short!("cardio"),
+        &String::from_str(&env, "Eval"),
+        &symbol_short!("routine"),
+        &BytesN::from_array(&env, &[0u8; 32]),
+        &Vec::new(&env),
+    );
+
+    client.accept_referral(&id, &receiving, &None);
+
+    let res = client.try_complete_referral(
+        &id,
+        &referring,
+        &BytesN::from_array(&env, &[0u8; 32]),
+        &String::from_str(&env, "N/A"),
+        &false,
+    );
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_share_care_summary() {
+    let env = Env::default();
+    let contract_id = env.register(HealthcareAnalytics, ());
+    let client = HealthcareAnalyticsClient::new(&env, &contract_id);
+    let (referring, receiving, patient) = setup_referral_parties(&env);
+
+    env.mock_all_auths();
+
+    let id = client.create_referral(
+        &referring,
+        &patient,
+        &receiving,
+        &symbol_short!("cardio"),
+        &String::from_str(&env, "Eval"),
+        &symbol_short!("routine"),
+        &BytesN::from_array(&env, &[0u8; 32]),
+        &Vec::new(&env),
+    );
+
+    client.share_care_summary(
+        &id,
+        &receiving,
+        &symbol_short!("consult"),
+        &BytesN::from_array(&env, &[10u8; 32]),
+    );
+
+    client.share_care_summary(
+        &id,
+        &referring,
+        &symbol_short!("progress"),
+        &BytesN::from_array(&env, &[11u8; 32]),
+    );
+}
+
+#[test]
+fn test_request_care_summary() {
+    let env = Env::default();
+    let contract_id = env.register(HealthcareAnalytics, ());
+    let client = HealthcareAnalyticsClient::new(&env, &contract_id);
+    let (referring, receiving, patient) = setup_referral_parties(&env);
+
+    env.mock_all_auths();
+
+    let id = client.create_referral(
+        &referring,
+        &patient,
+        &receiving,
+        &symbol_short!("cardio"),
+        &String::from_str(&env, "Eval"),
+        &symbol_short!("routine"),
+        &BytesN::from_array(&env, &[0u8; 32]),
+        &Vec::new(&env),
+    );
+
+    let mut info: Vec<Symbol> = Vec::new(&env);
+    info.push_back(symbol_short!("labs"));
+    info.push_back(symbol_short!("imaging"));
+
+    client.request_care_summary(&id, &receiving, &info);
+}
+
+#[test]
+fn test_get_referral_not_found() {
+    let env = Env::default();
+    let contract_id = env.register(HealthcareAnalytics, ());
+    let client = HealthcareAnalyticsClient::new(&env, &contract_id);
+
+    let res = client.try_get_referral(&999);
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_referral_full_lifecycle() {
+    let env = Env::default();
+    let contract_id = env.register(HealthcareAnalytics, ());
+    let client = HealthcareAnalyticsClient::new(&env, &contract_id);
+    let (referring, receiving, patient) = setup_referral_parties(&env);
+
+    env.mock_all_auths();
+
+    let id = client.create_referral(
+        &referring,
+        &patient,
+        &receiving,
+        &symbol_short!("cardio"),
+        &String::from_str(&env, "Full cardiac workup"),
+        &symbol_short!("urgent"),
+        &BytesN::from_array(&env, &[1u8; 32]),
+        &Vec::new(&env),
+    );
+
+    assert_eq!(client.get_referral(&id).status, ReferralStatus::Pending);
+
+    client.accept_referral(&id, &receiving, &Some(1700000000));
+    assert_eq!(client.get_referral(&id).status, ReferralStatus::Accepted);
+
+    client.update_referral_status(&id, &receiving, &symbol_short!("sched"), &None);
+    client.update_referral_status(&id, &receiving, &symbol_short!("in_prog"), &None);
+
+    client.complete_referral(
+        &id,
+        &receiving,
+        &BytesN::from_array(&env, &[2u8; 32]),
+        &String::from_str(&env, "Stable. Annual follow-up."),
+        &true,
+    );
+
+    let r = client.get_referral(&id);
+    assert_eq!(r.status, ReferralStatus::Completed);
+    assert!(r.accepted_at.is_some());
+    assert!(r.completed_at.is_some());
+}
+
+#[test]
+fn test_accept_after_decline_invalid_state() {
+    let env = Env::default();
+    let contract_id = env.register(HealthcareAnalytics, ());
+    let client = HealthcareAnalyticsClient::new(&env, &contract_id);
+    let (referring, receiving, patient) = setup_referral_parties(&env);
+
+    env.mock_all_auths();
+
+    let id = client.create_referral(
+        &referring,
+        &patient,
+        &receiving,
+        &symbol_short!("neuro"),
+        &String::from_str(&env, "Consult"),
+        &symbol_short!("routine"),
+        &BytesN::from_array(&env, &[0u8; 32]),
+        &Vec::new(&env),
+    );
+
+    client.decline_referral(&id, &receiving, &String::from_str(&env, "No"), &None);
+
+    let res = client.try_accept_referral(&id, &receiving, &None);
+    assert!(res.is_err());
+}
+
+#[test]
+fn test_update_status_cancelled() {
+    let env = Env::default();
+    let contract_id = env.register(HealthcareAnalytics, ());
+    let client = HealthcareAnalyticsClient::new(&env, &contract_id);
+    let (referring, receiving, patient) = setup_referral_parties(&env);
+
+    env.mock_all_auths();
+
+    let id = client.create_referral(
+        &referring,
+        &patient,
+        &receiving,
+        &symbol_short!("cardio"),
+        &String::from_str(&env, "Eval"),
+        &symbol_short!("routine"),
+        &BytesN::from_array(&env, &[0u8; 32]),
+        &Vec::new(&env),
+    );
+
+    client.update_referral_status(&id, &referring, &symbol_short!("cancelled"), &None);
+
+    let r = client.get_referral(&id);
+    assert_eq!(r.status, ReferralStatus::Cancelled);
+
+    let res = client.try_update_referral_status(&id, &referring, &symbol_short!("sched"), &None);
+    assert!(res.is_err());
 }
