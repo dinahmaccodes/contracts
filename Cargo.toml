@@ -24,6 +24,7 @@ members = [
   "contracts/hospital-discharge-management",
   "contracts/care-plan",
   "contracts/pacs-integration",
+  "contracts/rehabilitation-services",
   "contracts/prenatal-pediatric",
 ]
 
